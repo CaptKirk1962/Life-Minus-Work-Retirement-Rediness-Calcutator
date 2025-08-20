@@ -89,16 +89,15 @@ def generate_handbook(scores, archetype):
         add_paragraph(f"<b>Reflection Exercise:</b> {step['reflection']}")
         add_paragraph(f"<b>Next Best Action:</b> {step['action']}")
 
-    # Outro
     add_heading("About Life Minus Work")
     add_paragraph("Life Minus Work is more than a platform—it’s a movement to redefine what it means to thrive after your career.")
     add_paragraph("Whether you're stepping away from a long career or simply exploring what's next, we're here to help you:")
-    add_paragraph("- Find purpose beyond a job title
-- Build meaningful connections
-- Reignite curiosity and creativity
-- Stay healthy and inspired")
+    add_paragraph("- Find purpose beyond a job title")
+    add_paragraph("- Build meaningful connections")
+    add_paragraph("- Reignite curiosity and creativity")
+    add_paragraph("- Stay healthy and inspired")
     add_paragraph("Join our growing community of thoughtful explorers designing their next chapter—together.")
-    add_paragraph("👉 Download the full book: [lifeminuswork.com/join](https://www.lifeminuswork.com/join)")
+    add_paragraph("👉 Download the full book: lifeminuswork.com/join")
 
     doc.build(story)
     buffer.seek(0)
