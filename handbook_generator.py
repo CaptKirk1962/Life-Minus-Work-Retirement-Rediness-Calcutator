@@ -3,7 +3,7 @@ from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import getSampleStyleSheet
 from io import BytesIO
 
-def generate_handbook(scores, archetype):
+def generate_handbook(scores, archetype, user_name):
     buffer = BytesIO()
     doc = SimpleDocTemplate(buffer, pagesize=A4)
     styles = getSampleStyleSheet()
@@ -26,7 +26,7 @@ def generate_handbook(scores, archetype):
 
     # Scores
     add_heading("Your Retirement Readiness Score")
-    add_paragraph(f"Congratulations! Based on your responses, you are an: <b>{archetype}</b>")
+    add_paragraph(f"Congratulations, {user_name}! Based on your responses, you are an: <b>{archetype}</b>")
     add_paragraph("You thrive on structure, vision, and impact. The shift from being “in control” to “in transition” can feel unsettling.")
 
     add_heading("Readiness Breakdown")
