@@ -1,14 +1,12 @@
 # Life Minus Work — Retirement Readiness Report (fpdf 1.x)
-# - First name + "in your words"
-# - Compact mini chart (non-dominant; horizontal bars + grid)
-# - Retirement-focused guidance
-# - OpenAI Responses (NO response_format) with robust parsing + fallback
-# - Gmail app-password email (GMAIL_* or EMAIL_* secrets)
-# - Google Sheets append on code-send & verify
-# - PDF: fpdf 1.x (latin-1 safe), small logo at top-left, horizontal bar chart
-# - Hardened PDF rendering (strings/lists/dicts handled)
-# - If/Then words bolded in Implementation Intentions
-# - Footer disclaimer line
+# - Small top-left logo; body starts lower to avoid overlap
+# - Horizontal bar charts (page + PDF), subtle grid
+# - Bold **If** / **Then** in Implementation Intentions
+# - Signature Week + Progress Tracker render cleanly (no {...})
+# - Footer disclaimer on every page
+# - Hardened text handling (lists/dicts/strings) for PDF
+# - Gmail app-password email + Google Sheets logging
+# - OpenAI Responses API (no response_format) with robust parsing + fallback
 
 import os, io, json, random, smtplib, ssl, tempfile
 from datetime import datetime, timezone
@@ -30,13 +28,11 @@ def sget(k, default=""):
         pass
     return os.getenv(k, default)
 
-# Email (supports either naming style)
 EMAIL_SENDER = sget("GMAIL_USER") or sget("EMAIL_SENDER")
 EMAIL_APP_PASSWORD = sget("GMAIL_APP_PASSWORD") or sget("EMAIL_APP_PASSWORD")
 SENDER_NAME = sget("SENDER_NAME","Life Minus Work")
 REPLY_TO = sget("REPLY_TO", EMAIL_SENDER)
 
-# OpenAI
 AI_MODEL = sget("OPENAI_HIGH_MODEL","gpt-5-mini")
 MAX_TOK = int(sget("MAX_OUTPUT_TOKENS_HIGH", "8000") or "8000")
 _HAS_OPENAI=False
@@ -65,21 +61,18 @@ def _parse_response_text(resp) -> str:
         return ""
 
 def ai_json(prompt: str, max_tokens: int = 2400) -> dict:
-    """Responses.create without response_format; robustly parse text to JSON."""
     if not (_HAS_OPENAI and _client): return {}
     try:
         resp = _client.responses.create(model=AI_MODEL, input=prompt, max_output_tokens=max_tokens)
         text = _parse_response_text(resp)
-        if not text:
-            return {}
+        if not text: return {}
         if "{" in text and "}" in text:
-            start = text.find("{"); end = text.rfind("}")
-            text = text[start:end+1]
+            text = text[text.find("{"):text.rfind("}")+1]
         return json.loads(text)
     except Exception:
         return {}
 
-# Google Sheets
+# ------------------------------ Google Sheets ------------------------------
 LW_SHEET_URL = sget("LW_SHEET_URL","").strip()
 LW_SHEET_WORKSHEET = sget("LW_SHEET_WORKSHEET","emails").strip()
 
@@ -115,7 +108,7 @@ def log_email_capture(email: str, first_name: str, scores: dict, overall: int, s
     except Exception as e:
         st.warning(f"(Sheets capture failed: {e})")
 
-# Email helpers
+# ------------------------------ Email ------------------------------
 def _smtp_send(msg: EmailMessage):
     if not (EMAIL_SENDER and EMAIL_APP_PASSWORD):
         raise RuntimeError("Email sender/app password missing in Secrets.")
@@ -312,21 +305,21 @@ def rule_based_full_report(first_name: str, scores: dict, total: int, user_words
         "balancing_opportunity": f"Lift {', '.join(low_names)} with tiny, low-cost experiments aligned to your values.",
         "keep_in_view": ["One-sentence mission","Top 3 values","Morning ritual","One true yes","Boundary checklist","Weekly review"],
         "signature_week": [
-            "Mon: Clarify top values; write 1-sentence mission",
-            "Tue: Test a 10-15 min morning ritual",
-            "Wed: Declutter one small zone to support calm",
-            "Thu: Reach out to a friend for a 30-min call",
-            "Fri: Say no to one misaligned request",
-            "Sat: Run a one-week micro-experiment",
-            "Sun: Review wins; adjust next week"
+            {"day":"Monday","focus":"Health + Connection","plan":"Morning walk, midday call; evening light reading."},
+            {"day":"Tuesday","focus":"Learning","plan":"30-minute short course or book; try a new healthy recipe."},
+            {"day":"Wednesday","focus":"Purpose Project","plan":"90 minutes on a hands-on project tied to identity."},
+            {"day":"Thursday","focus":"Social","plan":"Attend a local class/group; introduce yourself to one person."},
+            {"day":"Friday","focus":"Restorative","plan":"Gentle movement + intentional call with family/friend."},
+            {"day":"Saturday","focus":"Adventure","plan":"Half-day outing: hike, museum, nearby town."},
+            {"day":"Sunday","focus":"Reflection & Planning","plan":"Short journaling; plan next week’s small goals."}
         ],
         "tiny_progress_tracker": [
-            "Completed 7 morning rituals",
-            "Wrote a one-sentence mission",
-            "Called a friend and had a meaningful chat",
-            "Explored one new place/group",
-            "Tracked two days and spotted an energy leak",
-            "Tried a one-week micro-experiment"
+            {"metric":"Minutes of movement per day","target":"20–40"},
+            {"metric":"Social touchpoints per week","target":"2"},
+            {"metric":"Learning sessions per week","target":"3 × 30 minutes"},
+            {"metric":"Micro-adventures per month","target":"1"},
+            {"metric":"Daily mood rating","target":"1–5 (note one quick reason)"},
+            {"metric":"One purposeful accomplishment per week","target":"1 (small project or meaningful outreach)"}
         ]
     }
 
@@ -344,10 +337,7 @@ def _as_text(x) -> str:
 def to_latin1(s) -> str:
     s = _as_text(s)
     if not s: return ""
-    rep = {
-        "—":"-", "–":"-", "-":"-", "“":'"', "”":'"', "‘":"'", "’":"'", "…":"...",
-        "•":"- ", "\xa0":" ", "→":"->"
-    }
+    rep = {"—":"-", "–":"-", "-":"-", "“":'"', "”":'"', "‘":"'", "’":"'", "…":"...", "•":"- ", "\xa0":" ", "→":"->"}
     for a, b in rep.items(): s = s.replace(a, b)
     return s.encode("latin-1", "ignore").decode("latin-1")
 
@@ -362,43 +352,44 @@ def normalize_report(data: dict) -> dict:
         "balancing_opportunity":"", "keep_in_view":[], "signature_week":[], "tiny_progress_tracker":[]
     }
     out = defaults.copy()
-    if not isinstance(data, dict): return out
-    out.update({k:v for k,v in data.items() if k in out})
-    list_keys = ["top_themes","signature_strengths","energizers","drainers","hidden_tensions",
-                 "actions","if_then","one_week_plan","keep_in_view","signature_week","tiny_progress_tracker"]
-    for k in list_keys:
+    if isinstance(data, dict): out.update({k:v for k,v in data.items() if k in out})
+    # keep list items as-is (don’t stringify dicts; we have custom renderers)
+    for k in ["top_themes","signature_strengths","energizers","drainers","hidden_tensions",
+              "actions","if_then","one_week_plan","keep_in_view","signature_week","tiny_progress_tracker"]:
         v = out.get(k, [])
         if isinstance(v, str): out[k] = [v]
-        elif isinstance(v, (list, tuple)): out[k] = [str(x) for x in v if x is not None]
+        elif isinstance(v, (list, tuple)): out[k] = list(v)
         else: out[k] = []
-    string_keys = ["archetype","core_need","signature_metaphor","signature_sentence",
-                   "from_your_words","what_this_says","insights","why_now","future_snapshot","watchout","balancing_opportunity"]
-    for k in string_keys: out[k] = "" if out.get(k) is None else str(out.get(k))
-    ts = out.get("theme_snapshot", {}); 
+    # allow strings OR lists (renderer handles both)
+    for k in ["archetype","core_need","signature_metaphor","signature_sentence",
+              "from_your_words","what_this_says","insights","why_now","future_snapshot",
+              "watchout","balancing_opportunity"]:
+        if out.get(k) is None: out[k] = ""
+    # snapshot dict
+    ts = out.get("theme_snapshot", {})
     if not isinstance(ts, dict): ts = {}
     out["theme_snapshot"] = {str(k): int(v) if isinstance(v, (int,float)) else v for k,v in ts.items()}
     return out
 
 class PDF(FPDF):
     def header(self):
-        # Small logo at top-left on the first page, like the Reflections report
+        # Small logo at top-left on first page
         if getattr(self, "_on_first_page", True):
             try:
                 if os.path.exists(LOGO_PATH):
                     with Image.open(LOGO_PATH) as im:
                         tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
                         im.convert("RGBA").save(tmp.name, format="PNG")
-                        # small + top-left
-                        self.image(tmp.name, x=10, y=8, w=28)
+                        self.image(tmp.name, x=10, y=8, w=24)  # smaller, left
             except Exception:
                 pass
             self._on_first_page = False
+        # Title (centered)
         self.set_y(8)
         self.set_font("Helvetica","B",16)
         self.cell(0,10,to_latin1("Life Minus Work — Retirement Readiness Report"),ln=1,align="C")
 
     def footer(self):
-        # Two-line footer: disclaimer + copyright
         self.set_y(-18)
         self.set_font("Helvetica","",7)
         disclaimer = "Life Minus Work • This report is a starting point for reflection. Nothing here is medical or financial advice."
@@ -423,32 +414,27 @@ def list_block(pdf, title, items):
     pdf.cell(0, 8, to_latin1(title), ln=1)
     for it in items: _p(pdf, f"• {it}", 11)
 
-def _write_if_then(pdf, item: str):
-    """
-    Write one Implementation Intention with bold 'If' and 'Then'.
-    Uses pdf.write for inline style changes and natural wrapping.
-    """
-    s = str(item or "")
+def _write_if_then(pdf, item):
+    # Accept dict {'if':..., 'then':...} or a string
+    if isinstance(item, dict):
+        if_text = str(item.get("if","")).strip()
+        then_text = str(item.get("then","")).strip()
+        s = f"If {if_text} then {then_text}"
+    else:
+        s = str(item or "")
     low = s.lower()
     if not low.startswith("if "):
         _p(pdf, f"• {s}", 11)
         return
-    # find ' then ' (case-insensitive)
     idx = low.find(" then ")
     if idx == -1:
-        # bold the starting 'If' only
         pdf.set_font("Helvetica","",11)
         pdf.cell(5,6,to_latin1("• "), ln=0)
-        pdf.set_font("Helvetica","B",11)
-        pdf.write(6, to_latin1("If"))
-        pdf.set_font("Helvetica","",11)
-        pdf.write(6, to_latin1(s[2:]))  # rest after 'If'
-        pdf.ln(6)
-        return
-    before = s[3:idx]  # text between 'If ' and ' then '
-    after = s[idx+6:]  # text after ' then '
-    pdf.set_font("Helvetica","",11)
-    pdf.cell(5,6,to_latin1("• "), ln=0)
+        pdf.set_font("Helvetica","B",11); pdf.write(6, to_latin1("If"))
+        pdf.set_font("Helvetica","",11); pdf.write(6, to_latin1(s[2:]))
+        pdf.ln(6); return
+    before = s[3:idx]; after = s[idx+6:]
+    pdf.set_font("Helvetica","",11); pdf.cell(5,6,to_latin1("• "), ln=0)
     pdf.set_font("Helvetica","B",11); pdf.write(6, to_latin1("If"))
     pdf.set_font("Helvetica","",11); pdf.write(6, to_latin1(" " + before + " "))
     pdf.set_font("Helvetica","B",11); pdf.write(6, to_latin1("Then"))
@@ -460,31 +446,46 @@ def list_block_if_then(pdf, title, items):
     if not isinstance(items, (list, tuple)): items = [items]
     pdf.set_font("Helvetica","B",13)
     pdf.cell(0, 8, to_latin1(title), ln=1)
+    for it in items: _write_if_then(pdf, it)
+
+def list_block_signature_week(pdf, title, items):
+    if not items: return
+    if not isinstance(items, (list, tuple)): items = [items]
+    pdf.set_font("Helvetica","B",13); pdf.cell(0,8,to_latin1(title), ln=1)
     for it in items:
-        _write_if_then(pdf, it)
+        if isinstance(it, dict):
+            day = it.get("day",""); focus = it.get("focus",""); plan = it.get("plan","")
+            _p(pdf, f"• {day} — {focus}: {plan}", 11)
+        else:
+            _p(pdf, f"• {it}", 11)
+
+def list_block_progress_tracker(pdf, title, items):
+    if not items: return
+    if not isinstance(items, (list, tuple)): items = [items]
+    pdf.set_font("Helvetica","B",13); pdf.cell(0,8,to_latin1(title), ln=1)
+    for it in items:
+        if isinstance(it, dict):
+            m = it.get("metric",""); t = it.get("target","")
+            _p(pdf, f"• {m} — {t}", 11)
+        else:
+            _p(pdf, f"• {it}", 11)
 
 def _scores_chart_png(theme_scores: Dict[str,int]) -> str:
-    """Horizontal bars with subtle grid, compact for PDF."""
-    labels = list(theme_scores.keys())
-    values = [theme_scores[k] for k in labels]
+    labels = list(theme_scores.keys()); values = [theme_scores[k] for k in labels]
     fig, ax = plt.subplots(figsize=(4.0,1.6), dpi=140)
     ax.barh(labels, values)
-    ax.set_xlim(0,10)
-    ax.grid(axis="x", alpha=0.3)
-    for spine in ["top","right"]:
-        ax.spines[spine].set_visible(False)
-    ax.set_title("Theme Snapshot")
-    plt.tight_layout()
+    ax.set_xlim(0,10); ax.grid(axis="x", alpha=0.3)
+    for spine in ["top","right"]: ax.spines[spine].set_visible(False)
+    ax.set_title("Theme Snapshot"); plt.tight_layout()
     tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
-    fig.savefig(tmp.name, bbox_inches="tight", dpi=140)
-    plt.close(fig)
+    fig.savefig(tmp.name, bbox_inches="tight", dpi=140); plt.close(fig)
     return tmp.name
 
 def build_pdf(first_name: str, scores: dict, overall_score: int, data:dict) -> bytes:
     data = normalize_report(data)
     pdf=PDF(); pdf.set_auto_page_break(True,18); pdf.add_page()
+    pdf.set_y(42)  # <-- start body lower so nothing overlaps the logo/title
 
-    # Greeting + core identity
     _p(pdf, f"Hi {first_name or 'there'},",12)
     _p(pdf, "Here’s a calm snapshot of your emotional and mental readiness for life after work.",11)
     pdf.ln(2)
@@ -494,39 +495,29 @@ def build_pdf(first_name: str, scores: dict, overall_score: int, data:dict) -> b
     sec(pdf, "Signature Metaphor", data["signature_metaphor"])
     sec(pdf, "Signature Sentence", data["signature_sentence"])
 
-    # Scores & themes
     pdf.ln(1); pdf.set_font("Helvetica","B",13); pdf.cell(0,8,to_latin1("Scores at a glance"),ln=1)
     _p(pdf, f"Overall readiness: {overall_score}/10",11)
-    for k,v in scores.items():
-        _p(pdf, f"{LABELS.get(k,k)}: {v}/10",11)
+    for k,v in scores.items(): _p(pdf, f"{LABELS.get(k,k)}: {v}/10",11)
 
-    # Theme chart image (horizontal bars)
     try:
         snap = {LABELS.get(k,k): v for k,v in scores.items()}
         png = _scores_chart_png(snap)
         if png and os.path.exists(png):
-            pdf.ln(1)
-            pdf.image(png, w=160)  # readable but not huge
+            pdf.ln(1); pdf.image(png, w=160)
     except Exception:
         pass
 
-    # From your words + meaning
-    if data.get("from_your_words"):
-        sec(pdf, "From your words", data["from_your_words"])
-    if data.get("what_this_says"):
-        sec(pdf, "What this really says about you", data["what_this_says"])
+    if data.get("from_your_words"): sec(pdf, "From your words", data["from_your_words"])
+    if data.get("what_this_says"):  sec(pdf, "What this really says about you", data["what_this_says"])
 
-    # Guidance
     sec(pdf, "Insights", data["insights"])
     sec(pdf, "Why Now", data["why_now"])
     sec(pdf, "Future Snapshot (1 month)", data["future_snapshot"])
 
-    # Lists
     list_block(pdf, "Signature Strengths", data["signature_strengths"])
     list_block(pdf, "Energizers", data["energizers"])
     list_block(pdf, "Drainers", data["drainers"])
     list_block(pdf, "Hidden Tensions", data["hidden_tensions"])
-
     sec(pdf, "Watch-out (gentle blind spot)", data["watchout"])
 
     list_block(pdf, "3 Next-step Actions (7 days)", data["actions"])
@@ -536,10 +527,9 @@ def build_pdf(first_name: str, scores: dict, overall_score: int, data:dict) -> b
     if data.get("balancing_opportunity"):
         sec(pdf, "Balancing Opportunity", data["balancing_opportunity"])
     list_block(pdf, "Keep This In View", data["keep_in_view"])
-    list_block(pdf, "Signature Week — At a glance", data["signature_week"])
-    list_block(pdf, "Tiny Progress Tracker", data["tiny_progress_tracker"])
+    list_block_signature_week(pdf, "Signature Week — At a glance", data["signature_week"])
+    list_block_progress_tracker(pdf, "Tiny Progress Tracker", data["tiny_progress_tracker"])
 
-    # Return as bytes (fpdf 1.x)
     return pdf.output(dest="S").encode("latin-1")
 
 # ------------------------------ UI ------------------------------
@@ -559,20 +549,16 @@ for t in THEMES:
 
 scores = compute_scores(st.session_state.answers); total = overall(scores)
 
-# Mini — compact horizontal bar chart + retirement-focused bullets
+# Mini — compact horizontal bar chart
 st.divider()
 st.subheader("Your Mini Report (Preview)")
 top3 = [k for k,_ in sorted(scores.items(), key=lambda kv: kv[1], reverse=True)[:3]]
 st.caption("Top strengths right now: " + ", ".join(LABELS.get(k,k) for k in top3))
 
 fig, ax = plt.subplots(figsize=(3.2,1.6), dpi=120)
-vals = [scores.get(k,0) for k in THEMES]
-labs = [LABELS.get(k,k) for k in THEMES]
-ax.barh(labs, vals)
-ax.set_xlim(0,10)
-ax.grid(axis="x", alpha=0.3)
-for spine in ["top","right"]:
-    ax.spines[spine].set_visible(False)
+vals = [scores.get(k,0) for k in THEMES]; labs = [LABELS.get(k,k) for k in THEMES]
+ax.barh(labs, vals); ax.set_xlim(0,10); ax.grid(axis="x", alpha=0.3)
+for spine in ["top","right"]: ax.spines[spine].set_visible(False)
 ax.set_title("Theme Snapshot")
 st.pyplot(fig, use_container_width=False)
 
