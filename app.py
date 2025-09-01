@@ -1,12 +1,12 @@
-# app_hotfix4.py — Life Minus Work • Retirement Readiness Report (fpdf 1.x)
-# Full robust version with:
+# Life Minus Work — Retirement Readiness Report (fpdf 1.x)
 # - First name + "in your words"
-# - Compact mini chart (on page, not dominant)
+# - Compact mini chart (non-dominant)
 # - Retirement-focused guidance
-# - OpenAI Responses (no response_format) with graceful fallback
+# - OpenAI Responses (NO response_format) with robust parsing + fallback
 # - Gmail app-password email (GMAIL_* or EMAIL_* secrets)
-# - Google Sheets append on code-send + verify
+# - Google Sheets append on code-send & verify
 # - PDF: fpdf 1.x (latin-1 safe), logo on cover (Life-Minus-Work-Logo.webp), embedded chart image
+# - Hardened PDF rendering (strings/lists/dicts all handled)
 
 import os, io, json, random, smtplib, ssl, tempfile
 from datetime import datetime, timezone
@@ -47,13 +47,36 @@ except Exception:
     _client=None
     _HAS_OPENAI=False
 
+def _parse_response_text(resp) -> str:
+    # Prefer .output_text when available, else dig through .output
+    text = getattr(resp, "output_text", "") or ""
+    if text:
+        return text
+    try:
+        parts=[]
+        for o in getattr(resp, "output", []):
+            for c in getattr(o, "content", []):
+                t = getattr(c, "text", None) or getattr(c, "output_text", None)
+                if isinstance(t, str):
+                    parts.append(t)
+        return "".join(parts)
+    except Exception:
+        return ""
+
 def ai_json(prompt: str, max_tokens: int = 2400) -> dict:
-    """Responses.create without response_format; returns {} on any error."""
+    """Responses.create without response_format; robustly parse text to JSON."""
     if not (_HAS_OPENAI and _client): return {}
     try:
         resp = _client.responses.create(model=AI_MODEL, input=prompt, max_output_tokens=max_tokens)
-        text = getattr(resp, "output_text", "") or ""
-        return json.loads(text) if text.strip().startswith("{") else {}
+        text = _parse_response_text(resp)
+        if not text:
+            return {}
+        # Try to extract the largest JSON block
+        if "{" in text and "}" in text:
+            start = text.find("{")
+            end = text.rfind("}")
+            text = text[start:end+1]
+        return json.loads(text)
     except Exception:
         return {}
 
@@ -308,14 +331,72 @@ def rule_based_full_report(first_name: str, scores: dict, total: int, user_words
         ]
     }
 
-# ------------------------------ PDF tools (latin-1 safe) ------------------------------
+# ------------------------------ Normalizers & PDF tools ------------------------------
 LOGO_PATH = "Life-Minus-Work-Logo.webp"  # expected in app working dir
 
-def to_latin1(s: str) -> str:
-    if not s: return ""
-    rep = {"—":"-","–":"-","-":"-","“":'"',"”":'"',"‘":"'", "’":"'", "…":"...", "•":"- ", "\xa0":" ", "→":"->"}
-    for a,b in rep.items(): s = s.replace(a,b)
-    return s.encode("latin-1","ignore").decode("latin-1")
+def _as_text(x) -> str:
+    """Coerce any value (str | list | dict | None) into a readable text block."""
+    if x is None:
+        return ""
+    if isinstance(x, (list, tuple)):
+        return "\n".join(f"• {str(item)}" for item in x if item is not None)
+    if isinstance(x, dict):
+        try:
+            return json.dumps(x, ensure_ascii=False, indent=2)
+        except Exception:
+            return str(x)
+    return str(x)
+
+def to_latin1(s) -> str:
+    """Make text safe for FPDF 1.x (latin-1 only) and handle non-string inputs."""
+    s = _as_text(s)
+    if not s:
+        return ""
+    rep = {
+        "—":"-", "–":"-", "-":"-", "“":'"', "”":'"', "‘":"'", "’":"'", "…":"...",
+        "•":"- ", "\xa0":" ", "→":"->"
+    }
+    for a, b in rep.items():
+        s = s.replace(a, b)
+    return s.encode("latin-1", "ignore").decode("latin-1")
+
+def normalize_report(data: dict) -> dict:
+    """Ensure all expected keys exist and have the right types."""
+    defaults = {
+        "archetype":"", "core_need":"", "signature_metaphor":"", "signature_sentence":"",
+        "top_themes":[], "theme_snapshot":{},
+        "from_your_words":"", "what_this_says":"",
+        "insights":"", "why_now":"", "future_snapshot":"",
+        "signature_strengths":[], "energizers":[], "drainers":[], "hidden_tensions":[],
+        "watchout":"", "actions":[], "if_then":[], "one_week_plan":[],
+        "balancing_opportunity":"", "keep_in_view":[], "signature_week":[], "tiny_progress_tracker":[]
+    }
+    out = defaults.copy()
+    if not isinstance(data, dict):
+        return out
+    out.update({k:v for k,v in data.items() if k in out})
+    # normalize list-like fields
+    list_keys = ["top_themes","signature_strengths","energizers","drainers","hidden_tensions",
+                 "actions","if_then","one_week_plan","keep_in_view","signature_week","tiny_progress_tracker"]
+    for k in list_keys:
+        v = out.get(k, [])
+        if isinstance(v, str):
+            out[k] = [v]
+        elif isinstance(v, (list, tuple)):
+            out[k] = [str(x) for x in v if x is not None]
+        else:
+            out[k] = []
+    # strings
+    string_keys = ["archetype","core_need","signature_metaphor","signature_sentence",
+                   "from_your_words","what_this_says","insights","why_now","future_snapshot",
+                   "watchout","balancing_opportunity"]
+    for k in string_keys:
+        out[k] = "" if out.get(k) is None else str(out.get(k))
+    # snapshot dict
+    ts = out.get("theme_snapshot", {})
+    if not isinstance(ts, dict): ts = {}
+    out["theme_snapshot"] = {str(k): int(v) if isinstance(v, (int,float)) else v for k,v in ts.items()}
+    return out
 
 class PDF(FPDF):
     def header(self):
@@ -340,13 +421,28 @@ class PDF(FPDF):
         self.cell(0,8,to_latin1("© Life Minus Work • lifeminuswork.com"),align="C")
 
 def _p(pdf, text, size=11, style=""):
-    pdf.set_font("Helvetica",style,size)
-    pdf.multi_cell(0,6,to_latin1(text or ""))
+    pdf.set_font("Helvetica", style, size)
+    pdf.multi_cell(0, 6, to_latin1(text))
+
+def sec(pdf, title, body):
+    pdf.set_font("Helvetica","B",13)
+    pdf.cell(0, 8, to_latin1(title), ln=1)
+    _p(pdf, body, 11)
+
+def list_block(pdf, title, items):
+    if not items:
+        return
+    if not isinstance(items, (list, tuple)):
+        items = [items]
+    pdf.set_font("Helvetica","B",13)
+    pdf.cell(0, 8, to_latin1(title), ln=1)
+    for it in items:
+        _p(pdf, f"• {it}", 11)
 
 def _scores_chart_png(theme_scores: Dict[str,int]) -> str:
     labels = list(theme_scores.keys())
     values = [theme_scores[k] for k in labels]
-    fig, ax = plt.subplots(figsize=(4.2,1.6), dpi=140)  # compact for PDF
+    fig, ax = plt.subplots(figsize=(4.0,1.5), dpi=140)  # compact for PDF
     ax.bar(labels, values)
     ax.set_ylim(0,10)
     ax.set_title("Theme Snapshot")
@@ -357,19 +453,18 @@ def _scores_chart_png(theme_scores: Dict[str,int]) -> str:
     return tmp.name
 
 def build_pdf(first_name: str, scores: dict, overall_score: int, data:dict) -> bytes:
+    data = normalize_report(data)
     pdf=PDF(); pdf.set_auto_page_break(True,18); pdf.add_page()
 
     # Greeting + core identity
     _p(pdf, f"Hi {first_name or 'there'},",12)
     _p(pdf, "Here’s a calm snapshot of your emotional and mental readiness for life after work.",11)
     pdf.ln(2)
-    def sec(title, body):
-        pdf.set_font("Helvetica","B",13); pdf.cell(0,8,to_latin1(title),ln=1); _p(pdf, body, 11)
 
-    sec("Archetype", data.get("archetype",""))
-    sec("Core Need", data.get("core_need",""))
-    sec("Signature Metaphor", data.get("signature_metaphor",""))
-    sec("Signature Sentence", data.get("signature_sentence",""))
+    sec(pdf, "Archetype", data["archetype"])
+    sec(pdf, "Core Need", data["core_need"])
+    sec(pdf, "Signature Metaphor", data["signature_metaphor"])
+    sec(pdf, "Signature Sentence", data["signature_sentence"])
 
     # Scores & themes
     pdf.ln(1); pdf.set_font("Helvetica","B",13); pdf.cell(0,8,to_latin1("Scores at a glance"),ln=1)
@@ -389,37 +484,32 @@ def build_pdf(first_name: str, scores: dict, overall_score: int, data:dict) -> b
 
     # From your words + meaning
     if data.get("from_your_words"):
-        sec("From your words", data["from_your_words"])
+        sec(pdf, "From your words", data["from_your_words"])
     if data.get("what_this_says"):
-        sec("What this really says about you", data["what_this_says"])
+        sec(pdf, "What this really says about you", data["what_this_says"])
 
     # Guidance
-    sec("Insights", data.get("insights",""))
-    sec("Why Now", data.get("why_now",""))
-    sec("Future Snapshot (1 month)", data.get("future_snapshot",""))
+    sec(pdf, "Insights", data["insights"])
+    sec(pdf, "Why Now", data["why_now"])
+    sec(pdf, "Future Snapshot (1 month)", data["future_snapshot"])
 
     # Lists
-    def list_block(title, items):
-        if items:
-            pdf.ln(1); pdf.set_font("Helvetica","B",13); pdf.cell(0,8,to_latin1(title), ln=1)
-            for it in items: _p(pdf, f"• {it}", 11)
+    list_block(pdf, "Signature Strengths", data["signature_strengths"])
+    list_block(pdf, "Energizers", data["energizers"])
+    list_block(pdf, "Drainers", data["drainers"])
+    list_block(pdf, "Hidden Tensions", data["hidden_tensions"])
 
-    list_block("Signature Strengths", data.get("signature_strengths"))
-    list_block("Energizers", data.get("energizers"))
-    list_block("Drainers", data.get("drainers"))
-    list_block("Hidden Tensions", data.get("hidden_tensions"))
+    sec(pdf, "Watch-out (gentle blind spot)", data["watchout"])
 
-    sec("Watch-out (gentle blind spot)", data.get("watchout",""))
-
-    list_block("3 Next-step Actions (7 days)", data.get("actions"))
-    list_block("Implementation Intentions (If-Then)", data.get("if_then"))
-    list_block("1-Week Gentle Plan", data.get("one_week_plan"))
+    list_block(pdf, "3 Next-step Actions (7 days)", data["actions"])
+    list_block(pdf, "Implementation Intentions (If-Then)", data["if_then"])
+    list_block(pdf, "1-Week Gentle Plan", data["one_week_plan"])
 
     if data.get("balancing_opportunity"):
-        sec("Balancing Opportunity", data["balancing_opportunity"])
-    list_block("Keep This In View", data.get("keep_in_view"))
-    list_block("Signature Week — At a glance", data.get("signature_week"))
-    list_block("Tiny Progress Tracker", data.get("tiny_progress_tracker"))
+        sec(pdf, "Balancing Opportunity", data["balancing_opportunity"])
+    list_block(pdf, "Keep This In View", data["keep_in_view"])
+    list_block(pdf, "Signature Week — At a glance", data["signature_week"])
+    list_block(pdf, "Tiny Progress Tracker", data["tiny_progress_tracker"])
 
     # Return as bytes (fpdf 1.x)
     return pdf.output(dest="S").encode("latin-1")
@@ -447,7 +537,7 @@ st.subheader("Your Mini Report (Preview)")
 top3 = [k for k,_ in sorted(scores.items(), key=lambda kv: kv[1], reverse=True)[:3]]
 st.caption("Top strengths right now: " + ", ".join(LABELS.get(k,k) for k in top3))
 
-fig, ax = plt.subplots(figsize=(3.5,1.5), dpi=120)  # compact
+fig, ax = plt.subplots(figsize=(3.2,1.4), dpi=120)  # compact, non-dominant
 ax.bar([LABELS.get(k,k) for k in THEMES],[scores.get(k,0) for k in THEMES])
 ax.set_ylim(0,10); ax.set_title("Theme Snapshot"); plt.xticks(rotation=35, ha="right")
 st.pyplot(fig, use_container_width=False)
