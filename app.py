@@ -1,417 +1,315 @@
-# app.py — Life Minus Work • Retirement Readiness Calculator
-# ---------------------------------------------------------------------
-# Features:
-# - Mini Report on page (numbers + GPT-5-mini narrative)
-# - Email capture + 6-digit verification (SMTP / Gmail App Password)
-# - Full PDF (same layout + logo as Reflection Report), downloadable & emailable
-# - Robust fallbacks (safe static content if AI or email fails)
-#
-# Streamlit Secrets needed (Settings → Secrets):
-# ------------------------------------------------
-# OPENAI_API_KEY = "sk-..."
-# EMAIL_SENDER = "whatisyourminus@gmail.com"        # or your sender
-# EMAIL_APP_PASSWORD = "xxxx xxxx xxxx xxxx"        # Gmail App Password
-# EMAIL_BCC = "lifeminuswork@gmail.com"             # optional
-# LMW_LOGO_FILE = "Life-Minus-Work-Logo.png"        # optional override
-# LMW_LOGO_FILE_WEBP = "Life-Minus-Work-Logo.webp"  # optional
-#
-# Requirements (add to requirements.txt):
-# ---------------------------------------
-# streamlit==1.36.0
-# fpdf==1.7.2
-# Pillow>=10.3.0
-# openai>=1.60.0
-# pandas>=2.2.2
-#
-# Folder layout suggestion:
-# main/
-#   app.py
-#   Life-Minus-Work-Logo.png        (or Life-Minus-Work-Logo.webp)
-#   DejaVuSans.ttf                  (optional, for broader glyphs)
-#   DejaVuSans-Bold.ttf             (optional)
-# ---------------------------------------------------------------------
+# app.py — Life Minus Work • Retirement Readiness (Non-Financial)
+# Mini Report → Email Verify → Full PDF. Google Sheets capture identical to Reflections app.
 
 from __future__ import annotations
-import os, io, math, json, time, smtplib, secrets as pysecrets
+import os, io, json, math, smtplib, csv
 from datetime import datetime, timezone
 from email.message import EmailMessage
 from pathlib import Path
+import secrets as pysecrets
 
 import streamlit as st
-import pandas as pd
 from fpdf import FPDF
 from PIL import Image
+import gspread
+import pandas as pd
 
-# ------------------------------
-# App setup
-# ------------------------------
-st.set_page_config(
-    page_title="LMW — Retirement Readiness",
-    page_icon="💫",
-    layout="wide",
-)
+# =========================
+# App & assets
+# =========================
+st.set_page_config(page_title="LMW — Retirement Readiness", page_icon="🌱", layout="wide")
 
 APP_DIR = Path(__file__).resolve().parent
 LOGO_PNG = st.secrets.get("LMW_LOGO_FILE", "Life-Minus-Work-Logo.png")
 LOGO_WEBP = st.secrets.get("LMW_LOGO_FILE_WEBP", "Life-Minus-Work-Logo.webp")
 
-# detect / prepare logo
-def resolve_logo_path() -> Path | None:
+def _resolve_logo() -> Path | None:
     png = APP_DIR / LOGO_PNG
     if png.exists():
         return png
     webp = APP_DIR / LOGO_WEBP
     if webp.exists():
         try:
-            tmp_png = APP_DIR / "_logo_tmp.png"
-            Image.open(webp).convert("RGBA").save(tmp_png)
-            return tmp_png
+            tmp = APP_DIR / "_lmw_logo_tmp.png"
+            Image.open(webp).convert("RGBA").save(tmp)
+            return tmp
         except Exception:
-            pass
+            return None
     return None
 
-LOGO_PATH = resolve_logo_path()
+LOGO_PATH = _resolve_logo()
 
-# ------------------------------
-# OpenAI (GPT-5-mini via Responses API)
-# ------------------------------
-AI_MODEL = "gpt-5-mini"  # match your working Reflection app
+# =========================
+# OpenAI (GPT-5-mini)
+# =========================
+AI_MODEL = "gpt-5-mini"
+_HAS_OPENAI = False
 try:
     from openai import OpenAI
     _client = OpenAI()
     _HAS_OPENAI = bool(st.secrets.get("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY"))
 except Exception:
-    _client, _HAS_OPENAI = None, False
+    _client = None
+    _HAS_OPENAI = False
 
-def ai_generate_narrative(inputs: dict) -> dict:
+def ai_write_summary(payload: dict, max_tokens: int = 2000) -> dict:
     """
-    Ask GPT-5-mini for succinct, structured retirement narrative.
-    Returns dict with keys: mini_headline, mini_bullets[], strengths[], risks[], actions[], tone
+    Calls GPT-5-mini via Responses API. Returns dict with:
+    { mini_headline, mini_bullets[], insights{}, actions[], postcard, tone }
     """
     if not _HAS_OPENAI or _client is None:
         return {}
-
     sys = (
-        "You are a careful retirement planning writer for Life Minus Work. "
-        "Write concise, kind, non-fearful guidance. Prefer small, reversible steps. "
-        "Return pure JSON matching the provided schema. No extra prose."
+        "You are a calm, encouraging coach for Life Minus Work. "
+        "Use the scores (0-10) across six domains (Identity, Social, Health, Learning, Adventure, Giving) "
+        "to compose helpful, non-judgmental reflections. Offer tiny, practical steps. "
+        "Return ONLY valid JSON per the schema—no extra text."
     )
     user = {
-        "task": "retirement_readiness_summary",
+        "task": "retirement_readiness_nonfinancial",
         "schema": {
-            "mini_headline": "string (<= 90 chars, upbeat & calm)",
-            "mini_bullets": ["string", "string", "string"],
-            "strengths": ["string", "string", "string"],
-            "risks": ["string", "string", "string"],
-            "actions": ["string", "string", "string", "string"],
-            "tone": "string (e.g., 'calm, practical, encouraging')"
+            "mini_headline": "string (<= 90 chars)",
+            "mini_bullets": ["string","string","string"],
+            "insights": {
+                "top_themes": ["string","string","string"],
+                "balancing_opportunities": ["string","string","string"]
+            },
+            "actions": ["string","string","string","string","string"],
+            "postcard": "string (a short, kind paragraph as if from '1 month ahead')",
+            "tone": "string"
         },
-        "inputs": inputs,
+        "inputs": payload
     }
-
     try:
-        # NOTE: Do not set temperature (gpt-5-mini supports default only).
-        # Use max_output_tokens instead of max_tokens.
         resp = _client.responses.create(
             model=AI_MODEL,
-            max_output_tokens=1200,
-            input=[{"role":"system","content":sys},{"role":"user","content":json.dumps(user)}],
-            # json output hint
+            max_output_tokens=min(5000, max_tokens),
+            input=[
+                {"role":"system","content":sys},
+                {"role":"user","content":json.dumps(user)}
+            ],
             response_format={"type":"json_object"},
         )
         text = resp.output_text or ""
-        data = json.loads(text) if text.strip().startswith("{") else {}
-        return data if isinstance(data, dict) else {}
+        return json.loads(text) if text.strip().startswith("{") else {}
     except Exception as e:
         st.info(f"AI fell back to safe content ({e})")
         return {}
 
-# ------------------------------
-# Email utils (verification + send PDF)
-# ------------------------------
+# =========================
+# Email (Gmail App Password)
+# =========================
 EMAIL_SENDER = st.secrets.get("EMAIL_SENDER", "")
 EMAIL_APP_PASSWORD = st.secrets.get("EMAIL_APP_PASSWORD", "")
 EMAIL_BCC = st.secrets.get("EMAIL_BCC", "")
 
 def _smtp_send(msg: EmailMessage):
-    """Send email via Gmail SMTP with app password."""
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=20) as smtp:
-        smtp.login(EMAIL_SENDER, EMAIL_APP_PASSWORD)
-        smtp.send_message(msg)
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=25) as s:
+        s.login(EMAIL_SENDER, EMAIL_APP_PASSWORD)
+        s.send_message(msg)
 
 def send_verification_code(to_email: str, code: str):
-    if not EMAIL_SENDER or not EMAIL_APP_PASSWORD:
+    if not (EMAIL_SENDER and EMAIL_APP_PASSWORD):
         raise RuntimeError("Email sender/app password missing in Secrets.")
-    msg = EmailMessage()
-    msg["From"] = EMAIL_SENDER
-    msg["To"] = to_email
-    if EMAIL_BCC:
-        msg["Bcc"] = EMAIL_BCC
-    msg["Subject"] = "Your Life Minus Work verification code"
-    body = (
-        f"Here’s your Life Minus Work code: {code}\n\n"
+    m = EmailMessage()
+    m["From"] = EMAIL_SENDER
+    m["To"] = to_email
+    if EMAIL_BCC: m["Bcc"] = EMAIL_BCC
+    m["Subject"] = "Your Life Minus Work verification code"
+    m.set_content(
+        f"Here’s your code: {code}\n\n"
         "Enter this in the app to unlock your full Retirement Readiness Report (PDF). "
-        "The code expires in 10 minutes."
+        "Code expires in ~10 minutes."
     )
-    msg.set_content(body)
-    _smtp_send(msg)
+    _smtp_send(m)
 
-def send_pdf_report(to_email: str, pdf_bytes: bytes, filename: str = "LMW_Retirement_Readiness_Report.pdf"):
-    if not EMAIL_SENDER or not EMAIL_APP_PASSWORD:
+def send_pdf(to_email: str, pdf_bytes: bytes, filename: str):
+    if not (EMAIL_SENDER and EMAIL_APP_PASSWORD):
         raise RuntimeError("Email sender/app password missing in Secrets.")
-    msg = EmailMessage()
-    msg["From"] = EMAIL_SENDER
-    msg["To"] = to_email
-    if EMAIL_BCC:
-        msg["Bcc"] = EMAIL_BCC
-    msg["Subject"] = "Your Life Minus Work — Retirement Readiness Report (PDF)"
-    msg.set_content(
-        "Attached is your full Retirement Readiness Report from Life Minus Work.\n"
-        "Keep the PDF handy and revisit it weekly to keep momentum going.\n\n"
-        "Warmly,\nLife Minus Work"
-    )
-    msg.add_attachment(pdf_bytes, maintype="application", subtype="pdf", filename=filename)
-    _smtp_send(msg)
+    m = EmailMessage()
+    m["From"] = EMAIL_SENDER
+    m["To"] = to_email
+    if EMAIL_BCC: m["Bcc"] = EMAIL_BCC
+    m["Subject"] = "Your Life Minus Work — Retirement Readiness Report (PDF)"
+    m.set_content("Attached is your full report. Keep it handy and revisit weekly to keep momentum.\n\n— Life Minus Work")
+    m.add_attachment(pdf_bytes, maintype="application", subtype="pdf", filename=filename)
+    _smtp_send(m)
 
-# ------------------------------
-# Finance math
-# ------------------------------
-def project_nest_egg(
-    age: int,
-    retire_age: int,
-    current_savings: float,
-    annual_contrib: float,
-    expected_return: float,
-    inflation: float,
-    fee_drag: float = 0.002,  # 0.2% annual
-) -> dict:
-    """
-    Simple annual compounding to retirement; returns values in future $ and today's $.
-    expected_return, inflation, fee_drag are annual decimals (e.g., 0.06)
-    """
-    years = max(0, retire_age - age)
-    r_net = max(0.0, expected_return - fee_drag)
-    bal = float(current_savings)
-    history = []
-    for y in range(1, years + 1):
-        bal = bal * (1 + r_net) + annual_contrib
-        history.append({"year": y, "age": age + y, "balance": bal})
-    future_balance = bal
-    # convert to today's dollars with inflation
-    real_factor = (1 + inflation) ** years
-    today_balance = future_balance / real_factor if years > 0 else future_balance
-    return {
-        "years": years,
-        "future_balance": future_balance,
-        "today_balance": today_balance,
-        "history": history,
-    }
+# =========================
+# Google Sheets capture (same as Reflections)
+# =========================
+LW_SHEET_URL = st.secrets.get("LW_SHEET_URL", "").strip()
+LW_SHEET_WORKSHEET = st.secrets.get("LW_SHEET_WORKSHEET", "emails")
+SHOW_EMAILS_ADMIN = st.secrets.get("LW_SHOW_EMAILS_ADMIN", "") == "1"
 
-def sustainable_income(balance_today_dollars: float, real_swr: float = 0.04) -> float:
-    """Real (today $) safe annual withdrawal."""
-    return balance_today_dollars * real_swr
-
-def readiness_score(sustainable: float, desired_income_today: float) -> int:
-    """0–100 capped score based on coverage of target income."""
-    if desired_income_today <= 0:
-        return 100
-    ratio = sustainable / desired_income_today
-    score = 100 * min(1.0, max(0.0, ratio))
-    # gentle curve for mid-range
-    if 0.4 < ratio < 1.0:
-        score = 100 * (0.5 * ratio + 0.3)
-    return int(round(score))
-
-def money(x: float) -> str:
+def gsheets_enabled() -> bool:
     try:
-        return "${:,.0f}".format(x)
+        return bool(st.secrets.get("gcp_service_account")) and bool(LW_SHEET_URL)
     except Exception:
-        return f"${x:,.2f}"
+        return False
 
-# ------------------------------
-# PDF builder (matches Reflection style)
-# ------------------------------
-class ReportPDF(FPDF):
-    def header(self):
-        if LOGO_PATH and LOGO_PATH.exists():
-            try:
-                self.image(str(LOGO_PATH), x=12, y=10, w=36)
-            except Exception:
-                pass
-        self.set_xy(14, 26)
-        self.set_font("Arial", "B", 24)
-        self.cell(0, 10, "Life Minus Work — Retirement Readiness Report", ln=1)
+@st.cache_resource(show_spinner=False)
+def get_gs_client():
+    sa = st.secrets.get("gcp_service_account", None)
+    if not sa: raise RuntimeError("gcp_service_account not found in secrets")
+    return gspread.service_account_from_dict(sa)
 
-    def footer(self):
-        self.set_y(-15)
-        self.set_font("Arial", "", 8)
-        self.cell(0, 8, f"© {datetime.now().year} Life Minus Work · lifeminuswork.com", align="C")
+@st.cache_resource(show_spinner=False)
+def get_email_ws():
+    if not gsheets_enabled(): raise RuntimeError("Google Sheets not configured")
+    gc = get_gs_client()
+    sh = gc.open_by_url(LW_SHEET_URL)
+    try:
+        ws = sh.worksheet(LW_SHEET_WORKSHEET)
+    except gspread.exceptions.WorksheetNotFound:
+        ws = sh.add_worksheet(title=LW_SHEET_WORKSHEET, rows=2000, cols=8)
+    header = ["email","first_name","verified_at","model","scores","source"]
+    existing = ws.row_values(1)
+    if [h.strip().lower() for h in existing] != header:
+        ws.update("A1:F1", [header])
+    return ws
 
-def pdf_text(pdf: ReportPDF, txt: str, size=11, style=""):
-    pdf.set_font("Arial", style, size)
-    # guard for latin-1
-    safe = txt.encode("latin-1", errors="ignore").decode("latin-1")
-    pdf.multi_cell(0, 6, safe)
-
-def build_pdf(first_name: str, inputs: dict, calc: dict, ai: dict) -> bytes:
-    pdf = ReportPDF(orientation="P", unit="mm", format="Letter")
-    pdf.set_auto_page_break(auto=True, margin=18)
-    pdf.add_page()
-
-    # Intro
-    pdf.ln(10)
-    pdf_text(pdf, f"Hi {first_name or 'there'},", 12)
-    pdf_text(pdf, "Here’s a calm, practical snapshot of your retirement readiness based on the inputs you provided.", 11)
-    pdf.ln(2)
-
-    # Key numbers
-    fb = calc["future_balance"]; tb = calc["today_balance"]
-    swr = sustainable_income(tb)
-    des = inputs["desired_income_today"]
-    score = readiness_score(swr, des)
-
-    pdf.set_font("Arial", "B", 14); pdf.cell(0, 8, "Key Numbers", ln=1)
-    pdf.set_font("Arial", "", 11)
-    pdf.cell(0, 6, f"Projected nest egg at {inputs['retire_age']}: {money(fb)} (future $)", ln=1)
-    pdf.cell(0, 6, f"Nest egg in today’s dollars: {money(tb)}", ln=1)
-    pdf.cell(0, 6, f"Sustainable annual income (today $): {money(swr)}", ln=1)
-    pdf.cell(0, 6, f"Desired annual income (today $): {money(des)}", ln=1)
-    pdf.cell(0, 6, f"Readiness score: {score}/100", ln=1)
-    pdf.ln(2)
-
-    # Mini narrative
-    if ai:
-        pdf.set_font("Arial", "B", 14); pdf.cell(0, 8, "Your Snapshot", ln=1)
-        pdf_text(pdf, ai.get("mini_headline", ""), 12)
-        for b in ai.get("mini_bullets", [])[:5]:
-            pdf_text(pdf, f"• {b}", 11)
-        pdf.ln(2)
-
-        pdf.set_font("Arial", "B", 14); pdf.cell(0, 8, "Strengths", ln=1)
-        for s in ai.get("strengths", [])[:6]:
-            pdf_text(pdf, f"• {s}", 11)
-
-        pdf.set_font("Arial", "B", 14); pdf.cell(0, 8, "Risks to watch", ln=1)
-        for r in ai.get("risks", [])[:6]:
-            pdf_text(pdf, f"• {r}", 11)
-
-        pdf.set_font("Arial", "B", 14); pdf.cell(0, 8, "Next tiny steps", ln=1)
-        for a in ai.get("actions", [])[:8]:
-            pdf_text(pdf, f"• {a}", 11)
-
-    # Inputs appendix
-    pdf.ln(4)
-    pdf.set_font("Arial", "B", 14); pdf.cell(0, 8, "Inputs (for reference)", ln=1)
-    pdf.set_font("Arial", "", 11)
-    for k in [
-        "age","retire_age","current_savings","annual_contrib","expected_return","inflation",
-        "fee_drag","desired_income_today"
-    ]:
-        v = inputs.get(k)
-        if k in {"expected_return","inflation","fee_drag"}:
-            pdf.cell(0, 6, f"{k.replace('_',' ').title()}: {round(100*v,2)}%", ln=1)
-        elif k in {"current_savings","annual_contrib","desired_income_today"}:
-            pdf.cell(0, 6, f"{k.replace('_',' ').title()}: {money(v)}", ln=1)
-        else:
-            pdf.cell(0, 6, f"{k.replace('_',' ').title()}: {v}", ln=1)
-
-    # Output
-    out = pdf.output(dest="S")
-    if isinstance(out, str):
-        out = out.encode("latin-1", errors="ignore")
-    return out
-
-# ------------------------------
-# UI — Inputs
-# ------------------------------
-st.title("Life Minus Work — Retirement Readiness")
-st.caption("A calm calculator to see where you stand, what’s strong, and what one tiny step to take next.")
-
-with st.expander("About this tool", expanded=False):
-    st.write(
-        "We project your nest egg at retirement, convert to today’s dollars, then estimate a real, sustainable income. "
-        "You’ll see a **Mini Report** immediately. To unlock your **full PDF report** (with narrative & checklist), "
-        "we’ll verify your email—no spam, ever."
-    )
-
-c1, c2, c3 = st.columns(3)
-with c1:
-    age = st.number_input("Your age", min_value=18, max_value=80, value=45)
-    retire_age = st.number_input("Target retirement age", min_value=age, max_value=80, value=max(60, age+15))
-    current_savings = st.number_input("Current retirement savings ($)", min_value=0, step=1000, value=150000)
-with c2:
-    annual_contrib = st.number_input("Annual contribution ($/yr)", min_value=0, step=1000, value=18000)
-    expected_return = st.slider("Expected annual return (nominal %)", 2.0, 10.0, 6.0, step=0.1) / 100.0
-    inflation = st.slider("Inflation assumption (annual %)", 1.0, 5.0, 2.5, step=0.1) / 100.0
-with c3:
-    fee_drag = st.slider("Fee drag (%/yr)", 0.0, 1.0, 0.2, step=0.05) / 100.0
-    desired_income_today = st.number_input("Desired retirement income (today $/yr)", min_value=0, step=1000, value=70000)
-    first_name = st.text_input("Your first name (for the report)", value="")
-
-inputs = dict(
-    age=int(age),
-    retire_age=int(retire_age),
-    current_savings=float(current_savings),
-    annual_contrib=float(annual_contrib),
-    expected_return=float(expected_return),
-    inflation=float(inflation),
-    fee_drag=float(fee_drag),
-    desired_income_today=float(desired_income_today),
-)
-
-calc = project_nest_egg(**inputs)
-swr = sustainable_income(calc["today_balance"])
-score = readiness_score(swr, desired_income_today)
-
-st.subheader("Your Mini Report (Preview)")
-left, right = st.columns([1,1.1])
-with left:
-    st.metric("Readiness score", f"{score}/100")
-    st.metric("Nest egg at retirement (future $)", money(calc["future_balance"]))
-    st.metric("Nest egg (today $)", money(calc["today_balance"]))
-with right:
-    st.write("**Sustainable income (today $)**:", money(swr))
-    st.write("**Desired income (today $)**:", money(desired_income_today))
-    cov = 0 if desired_income_today==0 else int(round(100*swr/desired_income_today))
-    st.progress(min(100, max(0,cov)), text=f"Target coverage: {cov}%")
-
-# AI mini narrative
-ai_inputs = dict(
-    first_name=first_name or "friend",
-    readiness_score=score,
-    nest_egg_future=calc["future_balance"],
-    nest_egg_today=calc["today_balance"],
-    sustainable_income_today=swr,
-    desired_income_today=desired_income_today,
-    years_to_retirement=calc["years"],
-    assumptions={
-        "expected_return": inputs["expected_return"],
-        "inflation": inputs["inflation"],
-        "fee_drag": inputs["fee_drag"]
+def log_email_capture(email: str, first_name: str, scores: dict, source: str = "verify"):
+    row = {
+        "email": (email or "").strip().lower(),
+        "first_name": (first_name or "").strip(),
+        "verified_at": datetime.now(timezone.utc).isoformat(),
+        "model": AI_MODEL,
+        "scores": json.dumps(scores or {}),
+        "source": source,
     }
-)
-with st.spinner("Thinking through your snapshot…"):
-    ai = ai_generate_narrative(ai_inputs)
+    # Try Sheets first
+    try:
+        if gsheets_enabled():
+            ws = get_email_ws()
+            ws.append_row(
+                [row["email"], row["first_name"], row["verified_at"], row["model"], row["scores"], row["source"]],
+                value_input_option="USER_ENTERED",
+            )
+            return
+    except Exception as e:
+        st.warning(f"(Sheets capture failed; continuing) {e}")
 
-if ai:
-    st.markdown(f"**{ai.get('mini_headline','Your snapshot')}**")
-    for b in ai.get("mini_bullets", [])[:3]:
-        st.write(f"- {b}")
-else:
-    st.markdown("**Snapshot:** steady progress, focus on small, repeatable steps.")
-    st.write("- Keep contributions consistent; increase 1–2% next raise.")
-    st.write("- Prefer low-cost funds; review fees annually.")
-    st.write("- Revisit plan each quarter—tiny changes compound.")
+# =========================
+# Questionnaire (exact items; 0–10 sliders)
+# =========================
+QUESTIONS = {
+    "Purpose & Identity": [
+        "I feel confident about who I am beyond my work role.",
+        "I have a clear sense of purpose for my post-work life.",
+        "I rarely feel anxious or lost without my daily work routine.",
+        "I can easily reflect on my career achievements without regret."
+    ],
+    "Social Health & Community Connection": [
+        "I have strong relationships outside of work.",
+        "I actively nurture friendships and community connections.",
+        "I feel comfortable reaching out to new people.",
+        "Loneliness is not a concern for me right now."
+    ],
+    "Health & Vitality": [
+        "I maintain regular physical activity.",
+        "My mental and emotional wellbeing feels stable.",
+        "I prioritize sleep, nutrition, and stress management.",
+        "I have no major health barriers to exploring new activities."
+    ],
+    "Learning & Growth": [
+        "I actively pursue new knowledge or skills.",
+        "I have a growth mindset and enjoy learning challenges.",
+        "I make time for reading, courses, or hobbies that expand my mind.",
+        "Cognitive sharpness is a priority in my daily life."
+    ],
+    "Adventure & Exploration": [
+        "I seek out new experiences and adventures regularly.",
+        "I feel excited about exploring unfamiliar places or activities.",
+        "Novelty and discovery bring joy to my routine.",
+        "I step outside my comfort zone without much hesitation."
+    ],
+    "Giving Back": [
+        "I find ways to contribute to others or my community.",
+        "Mentoring or volunteering feels fulfilling to me.",
+        "I have opportunities to share my wisdom and experience.",
+        "Giving back is an important part of my identity."
+    ]
+}
 
-st.caption("Unlock your complete report to get a full narrative + strengths, risks, and next steps.")
+THEMES = list(QUESTIONS.keys())
+
+def compute_scores(responses: dict[str, list[int]]) -> dict[str, int]:
+    scores = {}
+    for theme, vals in responses.items():
+        if vals:
+            scores[theme] = int(round(sum(vals) / len(vals)))
+        else:
+            scores[theme] = 0
+    return scores
+
+def overall_score(scores: dict[str, int]) -> int:
+    if not scores: return 0
+    return int(round(sum(scores.values()) / len(scores)))
+
+# =========================
+# UI
+# =========================
+st.title("Life Minus Work — Retirement Readiness (Non-Financial)")
+st.caption("A quick check on identity, connection, vitality, learning, adventure, and giving back — without any money math.")
+
+with st.expander("How it works", expanded=False):
+    st.write(
+        "Use the sliders (0–10). You’ll get a **Mini Report** right away. "
+        "To unlock your **full PDF** (with insights, a 1-month-ahead postcard, and next steps), verify your email."
+    )
+    st.write("**Scale:** 0 = Not at all true · 5 = Somewhat true · 10 = Very true")
+
+# Collect answers
+if "answers" not in st.session_state:
+    st.session_state.answers = {t: [5]*len(QUESTIONS[t]) for t in THEMES}
+
+# Render sliders (keeps same look)
+for t in THEMES:
+    st.subheader(t)
+    for idx, q in enumerate(QUESTIONS[t]):
+        key = f"{t}:{idx}"
+        st.session_state.answers[t][idx] = st.slider(q, 0, 10, st.session_state.answers[t][idx], 1, key=key)
+
+# Compute
+scores = compute_scores(st.session_state.answers)
+total = overall_score(scores)
+top3 = [k for k,_ in sorted(scores.items(), key=lambda kv: kv[1], reverse=True)[:3]]
 
 st.divider()
+st.subheader("Your Mini Report (Preview)")
+c1, c2 = st.columns([1.0, 1.2], gap="large")
+with c1:
+    st.metric("Overall readiness", f"{total}/10")
+    for k in top3:
+        st.write(f"**Top strength** — {k}: {scores[k]}/10")
+with c2:
+    # AI short narrative
+    payload = {
+        "scores": scores,
+        "overall": total,
+        "top3": top3,
+        "horizon_weeks": 4,     # stay aligned with Reflections app wording
+    }
+    ai_mini = ai_write_summary(payload, max_tokens=1200) if _HAS_OPENAI else {}
+    if ai_mini:
+        st.markdown(f"**{ai_mini.get('mini_headline','Your snapshot')}**")
+        for b in ai_mini.get("mini_bullets", [])[:3]:
+            st.write(f"- {b}")
+    else:
+        st.markdown("**Snapshot:** you’ve got real momentum.")
+        st.write("- Keep what’s working; change one thing at a time.")
+        st.write("- Add a tiny, social element to something you already enjoy.")
+        st.write("- Schedule one small experiment this week.")
 
-# ------------------------------
-# Unlock — Email verification flow
-# ------------------------------
+st.caption("Unlock your complete report to see your 1-month postcard, insights, and next steps.")
+
+# =========================
+# Verify email → unlock full report
+# =========================
+st.divider()
 st.header("Unlock your complete report")
-st.write("We’ll email a 6-digit code to verify it’s you. No spam—ever.")
+st.write("We’ll email a 6-digit code to verify it’s really you. No spam—ever.")
 
 if "pending_email" not in st.session_state:
     st.session_state.pending_email = ""
@@ -428,13 +326,14 @@ with colA:
         if not e or "@" not in e:
             st.error("Please enter a valid email.")
         else:
-            # create and send code
-            code = "".join([str(pysecrets.randbelow(10)) for _ in range(6)])
+            code = "".join(str(pysecrets.randbelow(10)) for _ in range(6))
             st.session_state.sent_code = code
             st.session_state.pending_email = e
             try:
                 send_verification_code(e, code)
-                st.success(f"We emailed a code to {e}.")
+                # store a row immediately (attempt) for analytics, marked source: request-code
+                log_email_capture(e, st.session_state.get("first_name_input",""), {"scores": scores, "overall": total}, source="request-code")
+                st.success(f"We’ve emailed a code to {e}.")
             except Exception as ex:
                 st.error(f"Could not send email: {ex}")
 
@@ -443,30 +342,93 @@ with colB:
     if st.button("Verify"):
         if code_entered and code_entered.strip() == st.session_state.sent_code:
             st.session_state.verified = True
+            # durable capture on verify
+            log_email_capture(st.session_state.pending_email, st.session_state.get("first_name_input",""),
+                              {"scores": scores, "overall": total}, source="verify")
             st.success("Verified! Your full report is unlocked.")
         else:
-            st.error("That code doesn’t match. Please try again.")
+            st.error("That code doesn’t match. Try again.")
 
-st.divider()
+# =========================
+# PDF (same layout family as Reflections)
+# =========================
+class PDF(FPDF):
+    def header(self):
+        if LOGO_PATH and LOGO_PATH.exists():
+            try:
+                self.image(str(LOGO_PATH), x=12, y=10, w=36)
+            except Exception:
+                pass
+        self.set_xy(14, 26)
+        self.set_font("Arial", "B", 22)
+        self.cell(0, 10, "Life Minus Work — Retirement Readiness", ln=1)
 
-# ------------------------------
-# Full report — build / download / email
-# ------------------------------
+    def footer(self):
+        self.set_y(-15)
+        self.set_font("Arial", "", 8)
+        self.cell(0, 8, f"© {datetime.now().year} Life Minus Work · lifeminuswork.com", align="C")
+
+def _pdf_text(pdf: PDF, text: str, size=11, style=""):
+    pdf.set_font("Arial", style, size)
+    safe = text.encode("latin-1", errors="ignore").decode("latin-1")
+    pdf.multi_cell(0, 6, safe)
+
+def build_pdf(first_name: str, scores: dict, overall: int, ai: dict) -> bytes:
+    pdf = PDF(orientation="P", unit="mm", format="Letter")
+    pdf.set_auto_page_break(auto=True, margin=18)
+    pdf.add_page()
+    pdf.ln(8)
+
+    _pdf_text(pdf, f"Hi {first_name or 'there'},", 12)
+    _pdf_text(pdf, "Here’s a calm snapshot of your non-financial retirement readiness.", 11)
+
+    pdf.ln(2); pdf.set_font("Arial","B",14); pdf.cell(0,8,"Scores at a glance", ln=1)
+    pdf.set_font("Arial","",11)
+    pdf.cell(0,6, f"Overall readiness: {overall}/10", ln=1)
+    for k,v in scores.items():
+        pdf.cell(0,6, f"{k}: {v}/10", ln=1)
+
+    if ai:
+        pdf.ln(2); pdf.set_font("Arial","B",14); pdf.cell(0,8,"Your snapshot", ln=1)
+        _pdf_text(pdf, ai.get("mini_headline",""), 12)
+        for b in ai.get("mini_bullets", [])[:5]:
+            _pdf_text(pdf, f"• {b}", 11)
+
+        ins = ai.get("insights", {}) or {}
+        top_themes = ins.get("top_themes") or []
+        bal = ins.get("balancing_opportunities") or []
+
+        pdf.ln(2); pdf.set_font("Arial","B",14); pdf.cell(0,8,"Top themes", ln=1)
+        for t in top_themes: _pdf_text(pdf, f"• {t}", 11)
+
+        pdf.set_font("Arial","B",14); pdf.cell(0,8,"Balancing opportunities", ln=1)
+        for b in bal: _pdf_text(pdf, f"• {b}", 11)
+
+        pdf.set_font("Arial","B",14); pdf.cell(0,8,"Next tiny steps", ln=1)
+        for a in ai.get("actions", [])[:8]:
+            _pdf_text(pdf, f"• {a}", 11)
+
+        pdf.set_font("Arial","B",14); pdf.cell(0,8,"A note from 1 month ahead", ln=1)
+        _pdf_text(pdf, ai.get("postcard",""), 11)
+
+    out = pdf.output(dest="S")
+    if isinstance(out, str):
+        out = out.encode("latin-1", errors="ignore")
+    return out
+
+# =========================
+# Unlock → Full report actions
+# =========================
 if st.session_state.verified:
     st.subheader("Your full report")
-    st.caption("Note: generating your PDF can take up to ~1 minute.")
+    st.caption("Heads up: generating your PDF might take ~1 minute.")
 
-    # Generate AI (again) with richer allowance
-    if _HAS_OPENAI:
-        with st.spinner("Assembling your full narrative…"):
-            ai_full = ai_generate_narrative(ai_inputs)
-            if not ai_full:
-                ai_full = ai
-    else:
-        ai_full = ai
+    # richer AI call for full report
+    payload_full = {"scores": scores, "overall": total, "top3": top3, "horizon_weeks": 4}
+    ai_full = ai_write_summary(payload_full, max_tokens=3500) if _HAS_OPENAI else {}
 
     with st.spinner("Building PDF…"):
-        pdf_bytes = build_pdf(first_name, inputs, calc, ai_full or {})
+        pdf_bytes = build_pdf(st.session_state.get("first_name_input",""), scores, total, ai_full or {})
 
     cdl, cem = st.columns([1,1])
     with cdl:
@@ -480,19 +442,34 @@ if st.session_state.verified:
     with cem:
         if st.button("📧 Email my report"):
             try:
-                send_pdf_report(st.session_state.pending_email, pdf_bytes)
+                send_pdf(st.session_state.pending_email, pdf_bytes, "LMW_Retirement_Readiness_Report.pdf")
                 st.success(f"Sent the PDF to {st.session_state.pending_email}.")
             except Exception as e:
                 st.error(f"Could not send email: {e}")
 else:
-    st.info("Enter the code we emailed you to unlock the full report (download + email).")
+    st.info("Enter your 6-digit code to unlock the full PDF report and email options.")
 
-# ------------------------------
-# Debug / status (optional)
-# ------------------------------
+# =========================
+# Admin / debug
+# =========================
 with st.expander("AI status (debug)", expanded=False):
     st.write({
         "AI enabled": bool(_HAS_OPENAI),
         "Model": AI_MODEL,
         "Logo found": bool(LOGO_PATH and LOGO_PATH.exists()),
+        "Sheets configured": gsheets_enabled(),
     })
+
+if SHOW_EMAILS_ADMIN:
+    with st.expander("Captured emails (admin)", expanded=False):
+        st.write(f"Storage: {'Google Sheets' if gsheets_enabled() else 'disabled'}")
+        try:
+            if gsheets_enabled():
+                rows = get_email_ws().get_all_records()
+                st.write(f"Total captured: {len(rows)}")
+                if rows:
+                    st.dataframe(rows, use_container_width=True)
+            else:
+                st.info("Sheets not configured.")
+        except Exception as e:
+            st.error(f"Could not load emails: {e}")
