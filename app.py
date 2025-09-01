@@ -1,12 +1,6 @@
 
-# app_fixed.py — LMW Questionnaire (hotfix build)
-# - First name field
-# - Mini Report robust (chart + bullets + teaser + unlock list)
-# - Email secrets mapping: GMAIL_* or EMAIL_*
-# - OpenAI call WITHOUT response_format (no SDK mismatch)
-# - Verification flow + PDF email
-
-import os, io, json, random, smtplib, ssl
+# app_hotfix2.py — LMW Questionnaire (Unicode + Sheets + Mini Report quality)
+import os, io, json, random, smtplib, ssl, importlib.util
 from datetime import datetime, timezone
 from email.message import EmailMessage
 
@@ -14,9 +8,9 @@ import streamlit as st
 import matplotlib.pyplot as plt
 from fpdf import FPDF
 
-st.set_page_config(page_title="LMW Readiness — Hotfix", page_icon="🧭", layout="wide")
+# ---------------- Setup ----------------
+st.set_page_config(page_title="Life Minus Work — Readiness Check", page_icon="🧭", layout="wide")
 
-# ---- Secrets mapping
 def sget(k, default=""):
     try:
         if k in st.secrets: return st.secrets[k]
@@ -28,15 +22,21 @@ EMAIL_SENDER = sget("GMAIL_USER") or sget("EMAIL_SENDER")
 EMAIL_APP_PASSWORD = sget("GMAIL_APP_PASSWORD") or sget("EMAIL_APP_PASSWORD")
 SENDER_NAME = sget("SENDER_NAME","Life Minus Work")
 REPLY_TO = sget("REPLY_TO", EMAIL_SENDER)
-AI_MODEL = sget("OPENAI_HIGH_MODEL","gpt-5-mini")
 
-# ---- OpenAI client
+AI_MODEL = sget("OPENAI_HIGH_MODEL","gpt-5-mini")
+MAX_TOK = int(sget("MAX_OUTPUT_TOKENS_HIGH", "8000") or "8000")
+
+# Google Sheets
+LW_SHEET_URL = sget("LW_SHEET_URL","").strip()
+LW_SHEET_WORKSHEET = sget("LW_SHEET_WORKSHEET","emails").strip()
+
+# ---------------- OpenAI (compatible call) ----------------
 _HAS_OPENAI=False
 _client=None
 try:
     from openai import OpenAI
     _client = OpenAI()
-    _HAS_OPENAI=bool(sget("OPENAI_API_KEY"))
+    _HAS_OPENAI = bool(sget("OPENAI_API_KEY"))
 except Exception:
     _client=None
     _HAS_OPENAI=False
@@ -44,15 +44,13 @@ except Exception:
 def ai_json(prompt: str, max_tokens: int = 1200) -> dict:
     if not (_HAS_OPENAI and _client): return {}
     try:
-        # No response_format. Keep input as a single string for broad SDK compatibility.
         resp = _client.responses.create(model=AI_MODEL, input=prompt, max_output_tokens=max_tokens)
         text = getattr(resp, "output_text", "") or ""
         return json.loads(text) if text.strip().startswith("{") else {}
     except Exception:
-        # final fallback: return empty
         return {}
 
-# ---- Email
+# ---------------- Email ----------------
 def _smtp_send(msg: EmailMessage):
     if not (EMAIL_SENDER and EMAIL_APP_PASSWORD):
         raise RuntimeError("Email sender/app password missing in Secrets.")
@@ -87,7 +85,37 @@ def send_pdf(to_email: str, pdf_bytes: bytes, filename: str, first_name: str="")
     msg.add_attachment(pdf_bytes, maintype="application", subtype="pdf", filename=filename)
     _smtp_send(msg)
 
-# ---- Questionnaire
+# ---------------- Google Sheets logging ----------------
+def gsheets_enabled() -> bool:
+    try:
+        return bool(st.secrets.get("gcp_service_account")) and bool(LW_SHEET_URL)
+    except Exception:
+        return False
+
+@st.cache_resource(show_spinner=False)
+def _get_ws():
+    if not gsheets_enabled():
+        return None
+    import gspread
+    sa = st.secrets["gcp_service_account"]
+    gc = gspread.service_account_from_dict(sa)
+    sh = gc.open_by_url(LW_SHEET_URL)
+    try:
+        ws = sh.worksheet(LW_SHEET_WORKSHEET)
+    except Exception:
+        ws = sh.add_worksheet(title=LW_SHEET_WORKSHEET, rows=2000, cols=8)
+        ws.update("A1:E1", [["email","first_name","verified_at","scores","overall"]])
+    return ws
+
+def log_email_capture(email: str, first_name: str, scores: dict, overall: int):
+    try:
+        ws = _get_ws()
+        if ws:
+            ws.append_row([email.lower().strip(), first_name.strip(), datetime.now(timezone.utc).isoformat(), json.dumps(scores), overall], value_input_option="USER_ENTERED")
+    except Exception as e:
+        st.warning(f"(Sheets capture failed: {e})")
+
+# ---------------- Questionnaire ----------------
 THEMES = [
     "Purpose & Identity", "Social Health & Community Connection", "Health & Vitality",
     "Learning & Growth", "Adventure & Exploration", "Giving Back"
@@ -145,8 +173,58 @@ def compute_scores(responses: dict) -> dict:
 def overall(scores: dict) -> int:
     return int(round(sum(scores.values())/max(1,len(scores))))
 
-# ---- UI
-st.title("Life Minus Work — Readiness Check (Hotfix)")
+# ---------------- Retirement-relevant mini report ----------------
+def build_mini_copy(first_name: str, scores: dict):
+    top3 = [k for k,_ in sorted(scores.items(), key=lambda kv: kv[1], reverse=True)[:3]]
+    greeting = f"Hi {first_name}," if first_name else "Hi there,"
+    return {
+        "headline": f"{greeting} your current strengths are {', '.join(LABELS.get(k,k) for k in top3)}.",
+        "tiny_actions": [
+            "Send one message proposing a 20‑minute walk or coffee this week.",
+            "Plan one micro‑adventure within 30 minutes from home (Fri or Sun).",
+            "Offer a 30‑minute help session to someone who’d benefit from your experience."
+        ],
+        "teaser": [
+            "Mon: choose one lever and block 10 minutes.",
+            "Tue: one 20‑minute skill rep or short course video.",
+            "Wed: invite one person to join a quick activity."
+        ],
+        "unlock": [
+            "Future Snapshot (1‑month postcard).",
+            "Insights & Why Now (short narrative).",
+            "3 actions + If‑Then plan + 1‑week gentle plan.",
+            "Printable checklist page + Tiny progress tracker."
+        ]
+    }
+
+# ---------------- PDF (Unicode-safe) ----------------
+def to_latin1(s: str) -> str:
+    if not s: return ""
+    rep = {"—":"-","–":"-","‑":"-","“":'"',"”":'"',"‘":"'", "’":"'", "…":"...", "•":"- ", "\xa0":" ", "→":"->"}
+    for a,b in rep.items(): s = s.replace(a,b)
+    return s.encode("latin-1","ignore").decode("latin-1")
+
+class PDF(FPDF):
+    def header(self):
+        self.set_font("Helvetica","B",16); self.cell(0,10,to_latin1("Life Minus Work — Reflection Report"),ln=1,align="C")
+    def footer(self):
+        self.set_y(-15); self.set_font("Helvetica","",8); self.cell(0,8,to_latin1("© Life Minus Work"),align="C")
+
+def _p(pdf, text, size=11, style=""):
+    pdf.set_font("Helvetica",style,size)
+    pdf.multi_cell(0,6,to_latin1(text or ""))
+
+def build_pdf(first_name, scores, overall_score):
+    pdf=PDF(); pdf.set_auto_page_break(True,18); pdf.add_page()
+    _p(pdf, f"Hi {first_name or 'there'},",12)
+    _p(pdf, "Here’s a calm snapshot of your non‑financial readiness.",11)
+    pdf.ln(2); pdf.set_font("Helvetica","B",13); pdf.cell(0,8,to_latin1("Scores at a glance"),ln=1)
+    _p(pdf, f"Overall readiness: {overall_score}/10",11)
+    for k,v in scores.items(): _p(pdf, f"{LABELS.get(k,k)}: {v}/10",11)
+    out=io.BytesIO(); pdf.output(out); return out.getvalue()
+
+# ---------------- UI ----------------
+st.title("Life Minus Work — Readiness Check")
 first_name = st.text_input("Your first name (optional)", key="first_name_input")
 
 if "answers" not in st.session_state:
@@ -159,50 +237,25 @@ for t in THEMES:
 
 scores = compute_scores(st.session_state.answers); total = overall(scores)
 
-# ---- Mini Report (robust, Reflections-style)
 st.divider()
 st.subheader("Your Mini Report (Preview)")
 top3 = [k for k,_ in sorted(scores.items(), key=lambda kv: kv[1], reverse=True)[:3]]
 st.caption("Top themes: " + ", ".join(LABELS.get(k,k) for k in top3))
 
-# chart
-fig, ax = plt.subplots(figsize=(7,3))
+import matplotlib.pyplot as plt
+fig, ax = plt.subplots(figsize=(5.8,2.6), dpi=120)
 ax.bar([LABELS.get(k,k) for k in THEMES],[scores.get(k,0) for k in THEMES])
-ax.set_ylim(0,10); ax.set_title("Theme Snapshot"); plt.xticks(rotation=45, ha="right")
+ax.set_ylim(0,10); ax.set_title("Theme Snapshot"); plt.xticks(rotation=35, ha="right")
 st.pyplot(fig, use_container_width=True)
 
-prompt = (
-    "Return strict JSON with keys: mini_headline, tiny_actions[3], week_teaser[3], unlock[4]. "
-    f"First name: {first_name or 'friend'}. Scores: {json.dumps(scores)}."
-)
-ai = ai_json(prompt, max_tokens=900) if _HAS_OPENAI else {}
-
+mini = build_mini_copy(first_name, scores)
 st.markdown("**Tiny actions to try this week:**")
-for b in (ai.get("tiny_actions") if ai else [
-    "Invite someone for a 20‑minute walk this week.",
-    "Plan one micro‑adventure within 30 minutes from home.",
-    "Offer a 30‑minute help session to someone this week.",
-]):
-    st.write(f"- {b}")
-
+for b in mini["tiny_actions"]: st.write(f"- {b}")
 st.markdown("**Your next 7 days (teaser):**")
-for b in (ai.get("week_teaser") if ai else [
-    "Mon: choose one lever and block 10 minutes.",
-    "Tue: one 20‑minute skill rep.",
-    "Wed: invite one person to join a quick activity.",
-]):
-    st.write(f"- {b}")
-
+for b in mini["teaser"]: st.write(f"- {b}")
 st.markdown("**What you’ll unlock with the full report:**")
-for b in (ai.get("unlock") if ai else [
-    "Postcard from 1 month ahead (Future Snapshot).",
-    "Personalized insights & Why Now.",
-    "3 actions + If‑Then plan + 1‑week gentle plan.",
-    "Printable checklist page + Tiny progress tracker."
-]):
-    st.write(f"- {b}")
+for b in mini["unlock"]: st.write(f"- {b}")
 
-# ---- Verify + PDF
 st.divider()
 st.header("Unlock your complete Reflection Report")
 email = st.text_input("Your email", placeholder="you@example.com", key="email_input")
@@ -219,6 +272,7 @@ with cA:
             st.session_state.sent_code=code
             try:
                 send_verification_code(e, code, first_name=first_name)
+                log_email_capture(e, first_name, scores, total)
                 st.success(f"We’ve emailed a code to {e}.")
             except Exception as ex:
                 st.error(f"Could not send email: {ex}")
@@ -227,26 +281,10 @@ with cB:
     if st.button("Verify"):
         if v.strip()==st.session_state.sent_code:
             st.session_state.verified=True
+            log_email_capture(email, first_name, scores, total)
             st.success("Verified!")
         else:
             st.error("That code doesn’t match.")
-
-class PDF(FPDF):
-    def header(self):
-        self.set_font("Helvetica","B",16); self.cell(0,10,"Life Minus Work — Reflection Report",ln=1,align="C")
-    def footer(self):
-        self.set_y(-15); self.set_font("Helvetica","",8); self.cell(0,8,"© Life Minus Work",align="C")
-def _p(pdf, text, size=11, style=""):
-    pdf.set_font("Helvetica",style,size); pdf.multi_cell(0,6,(text or "").encode("latin-1","ignore").decode("latin-1"))
-
-def build_pdf(first_name, scores, overall):
-    pdf=PDF(); pdf.set_auto_page_break(True,18); pdf.add_page()
-    _p(pdf, f"Hi {first_name or 'there'},",12)
-    _p(pdf, "Here’s a calm snapshot of your non‑financial readiness.",11)
-    pdf.ln(2); pdf.set_font("Helvetica","B",13); pdf.cell(0,8,"Scores at a glance",ln=1)
-    _p(pdf, f"Overall readiness: {overall}/10",11)
-    for k,v in scores.items(): _p(pdf, f"{k}: {v}/10",11)
-    out=io.BytesIO(); pdf.output(out); return out.getvalue()
 
 if st.session_state.verified:
     pdf_bytes = build_pdf(first_name, scores, total)
